@@ -365,3 +365,59 @@ class DDPGAgent:
         self.soft_update()
 
         return float(critic_loss.item()), float(actor_loss.item())
+learning_rates = [0.001, 0.0001, 1e-5]
+
+def train_ddpg_lrum_per(actor_lr, critic_lr):
+
+    buffer = LRUM_PER_Replay(capacity=BUFFER_SIZE, lrum_history=LRUM_HISTORY)
+    agent = DDPGAgent(state_dim, action_dim, buffer,
+                      actor_lr=actor_lr,
+                      critic_lr=critic_lr)
+
+    distance_list = []
+    latency_list = []
+
+    for epoch in range(NUM_EPOCHS):
+
+        random.shuffle(experiences)
+
+        for exp in experiences:
+
+            s, a, r, s_next, done = exp[:5]
+
+            td = agent.compute_td_error(s, a, r, s_next, done)
+            buffer.add((s, a, r, s_next, done), td)
+
+            if len(buffer) >= BATCH_SIZE:
+                agent.train_step(BATCH_SIZE)
+
+        d, l = simulate_trajectory(agent, experiences)
+
+        distance_list.append(d)
+        latency_list.append(l)
+
+        print(
+            f"LR={actor_lr:.0e} | "
+            f"Epoch {epoch+1:03d}/{NUM_EPOCHS} | "
+            f"Distance={d:.4f} m | "
+            f"Latency={l:.4f} s | "
+            f"Buffer={len(buffer)}"
+        )
+
+    return distance_list, latency_list
+
+
+# ===== Run Training =====
+results_distance = {}
+results_latency = {}
+
+for lr in learning_rates:
+
+    print("\n" + "="*60)
+    print(f"Starting training for Learning Rate = {lr}")
+    print("="*60)
+
+    d, l = train_ddpg_lrum_per(actor_lr=lr, critic_lr=lr)
+
+    results_distance[lr] = d
+    results_latency[lr] = l

@@ -1,0 +1,367 @@
+import torch
+print(torch.__version__)
+
+import numpy as np
+import pandas as pd
+import random
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+
+import tensorflow as tf
+
+#os.makedirs(save_dir, exist_ok=True)
+
+
+#plt.rcParams['figure.figsize'] = (12,6)
+#plt.grid(True, linestyle="--", alpha=0.35)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+
+
+import os
+import numpy as np
+from PIL import Image
+import torch
+import torch.nn as nn
+import torchvision.models as models
+from torchvision.models import ResNet18_Weights
+import torchvision.transforms as transforms
+# ===== Hyperparameters =====
+BUFFER_SIZE = 50000
+LRUM_HISTORY = 5000        # how many recent experiences LRUM keeps after overflow
+BATCH_SIZE = 128
+NUM_EPOCHS = 5000           # number of passes through dataset (offline)
+GAMMA = 0.99
+TAU = 0.005
+ACTOR_LR = 3e-4
+CRITIC_LR = 1e-3
+SEED = 100
+mu=0.3
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+import os
+image_folder = r"C:\Users\Abrokwa\PycharmProjects\pythonProject1\dataset1"
+
+image_files = sorted([
+    os.path.join(image_folder, f)
+    for f in os.listdir(image_folder)
+    if f.lower().endswith(".jpg")
+])
+
+print("Total images:", len(image_files))
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+weights = ResNet18_Weights.DEFAULT
+cnn = models.resnet18(weights=weights)
+cnn = nn.Sequential(*list(cnn.children())[:-1])
+cnn.eval().to(device)
+
+transform = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor()
+])
+
+def extract_features(path):
+
+    img = Image.open(path).convert("RGB")
+    img = transform(img).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        feat = cnn(img)
+
+    return feat.cpu().numpy().flatten()
+
+states = []
+
+for i, img_path in enumerate(image_files):
+
+    if i % 500 == 0:
+        print("Processing image", i)
+
+    states.append(extract_features(img_path))
+
+states = np.array(states, dtype=np.float32)
+
+state_dim = states.shape[1]
+action_dim = 2
+
+print("State dimension:", states.shape)
+
+def compute_reward(s, s_next):
+
+    diff = np.linalg.norm(s_next - s)
+
+    collision = diff > 15.0
+
+    reward = -diff
+
+    if collision:
+        reward -= 10.0
+    else:
+        reward += 2.0
+
+    return reward, collision
+experiences = []
+
+max_exp = min(100, len(states)-1)
+
+
+
+for i in range(max_exp):
+
+    s = states[i]
+    s_next = states[i+1]
+
+    reward, collision = compute_reward(s, s_next)
+
+    action = np.random.uniform(-1, 1, size=2).astype(np.float32)
+
+    done = 1.0 if (collision or i == max_exp-1) else 0.0
+
+    experiences.append((s, action, reward, s_next, done, collision))
+print("Constructed experiences:", len(experiences))
+# ===== Networks =====
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, action_range=1.0):
+        super().__init__()
+        self.action_range = action_range
+        self.fc1 = nn.Linear(state_dim, 516)
+        self.fc2 = nn.Linear(516, 500)
+        self.fc3 = nn.Linear(500, action_dim)
+    def forward(self, s):
+        x = torch.relu(self.fc1(s))
+        x = torch.relu(self.fc2(x))
+        a = torch.tanh(self.fc3(x)) * self.action_range
+        return a
+
+class Critic(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim + action_dim, 400)
+        self.fc2 = nn.Linear(400, 300)
+        self.fc3 = nn.Linear(300, 1)
+    def forward(self, s, a):
+        x = torch.relu(self.fc1(torch.cat([s, a], dim=1)))
+        x = torch.relu(self.fc2(x))
+        q = self.fc3(x)
+        return q
+
+# ===== Replay buffers: PER-only and LRUM+PER =====
+class PERReplay:
+    """Simple prioritized replay: store (s,a,r,s',done,td) and sample from top-k priorities"""
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []  # list of tuples
+        self.count = 0
+
+    def add(self, experience, td_error):
+        # store with current td_error
+        if self.count < self.capacity:
+            self.buffer.append((experience, float(td_error)))
+            self.count += 1
+        else:
+            # Once full, overwrite oldest experiences (FIFO)
+            self.buffer[self.count % self.capacity] = (experience, float(td_error))
+            self.count += 1
+
+    def update_td(self, idx, new_td):
+        exp, _ = self.buffer[idx]
+        self.buffer[idx] = (exp, float(new_td))
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def sample(self, batch_size):
+        if len(self.buffer) == 0:
+            return []
+        # prioritize by td: sample uniformly from top-k where k = min(4*batch_size, len)
+        sorted_buf = sorted(self.buffer, key=lambda x: x[1], reverse=True)
+        k = min(len(sorted_buf), max(batch_size*4, batch_size))
+        topk = sorted_buf[:k]
+        sampled = random.sample(topk, min(batch_size, len(topk)))
+        # return list of experiences (without td)
+        return [s for (s, td) in sampled]
+
+
+class LRUM_PER_Replay:
+    """LRUM + PER: when capacity exceeded, keep only most recent lrum_history items"""
+    def __init__(self, capacity, lrum_history):
+        self.capacity = capacity
+        self.lrum_history = lrum_history
+        self.buffer = []
+        self.count = 0
+    def add(self, experience, td_error):
+        self.buffer.append((experience, float(td_error)))
+        self.count += 1
+        if self.count > self.capacity:
+            # First: keep recent entries (LRUM eviction)
+            # We'll keep last lrum_history entries (most recent)
+            # To keep priorities meaningful, we don't sort here; we simply evict older entries
+            # Equivalent to: self.buffer = self.buffer[-self.lrum_history:]
+            self.buffer = self.buffer[-self.lrum_history:]
+            # reset count to reflect current length to avoid repeated large growth
+            self.count = len(self.buffer)
+    def update_td(self, idx, new_td):
+        exp, _ = self.buffer[idx]
+        self.buffer[idx] = (exp, float(new_td))
+    def __len__(self):
+        return len(self.buffer)
+    def sample(self, batch_size):
+        if len(self.buffer) == 0:
+            return []
+        # PER step: prioritize by td
+        sorted_buf = sorted(self.buffer, key=lambda x: x[1], reverse=True)
+        k = min(len(sorted_buf), max(batch_size*4, batch_size))
+        topk = sorted_buf[:k]
+        sampled = random.sample(topk, min(batch_size, len(topk)))
+        return [s for (s, td) in sampled]
+
+# ===== DDPG Agent (uses its own replay buffer) =====
+
+
+
+# ===== UAV Trajectory Classes =====
+
+class Source:
+    def __init__(self, state):
+        self.state = state
+
+class Hop:
+    def __init__(self, state, action, reward):
+        self.state = state
+        self.action = action
+        self.reward = reward
+
+class TargetTrajectory:
+    def __init__(self):
+        self.hops = []
+        self.total_distance = 0.0
+        self.total_latency = 0.0
+
+    def add_hop(self, hop):
+        self.hops.append(hop)
+        # distance proxy: Euclidean norm of state change
+        if len(self.hops) > 1:
+            prev_state = self.hops[-2].state
+            curr_state = hop.state
+            self.total_distance += np.linalg.norm(curr_state - prev_state)
+
+        # latency proxy: use negative reward as latency indicator
+        self.total_latency += -hop.reward
+
+
+def simulate_trajectory(agent, experiences, max_steps=50):
+    agent.actor.eval()
+
+    trajectory = TargetTrajectory()
+
+    # Start from first state in dataset
+    state = experiences[0][0]
+
+    source = Source(state)
+
+    for step in range(max_steps):
+
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            action = agent.actor(state_tensor).cpu().numpy().flatten()
+
+        # Find closest matching transition in dataset (offline simulation)
+        # This approximates next-state dynamics
+        idx = min(step, len(experiences)-1)
+        next_state = experiences[idx][3]
+        reward = experiences[idx][2]
+
+        hop = Hop(next_state, action, reward)
+        trajectory.add_hop(hop)
+
+        state = next_state
+
+    return trajectory.total_distance, trajectory.total_latency
+
+
+
+
+
+
+
+class DDPGAgent:
+    def __init__(self, state_dim, action_dim, buffer_obj, actor_lr=ACTOR_LR, critic_lr=CRITIC_LR):
+        self.actor = Actor(state_dim, action_dim).to(device)
+        self.critic = Critic(state_dim, action_dim).to(device)
+        self.target_actor = Actor(state_dim, action_dim).to(device)
+        self.target_critic = Critic(state_dim, action_dim).to(device)
+        self.target_actor.load_state_dict(self.actor.state_dict())
+        self.target_critic.load_state_dict(self.critic.state_dict())
+        self.a_opt = optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.c_opt = optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.buffer = buffer_obj
+        self.gamma = GAMMA
+        self.tau = TAU
+
+    def soft_update(self):
+        for tp, p in zip(self.target_actor.parameters(), self.actor.parameters()):
+            tp.data.copy_(self.tau * p.data + (1.0 - self.tau) * tp.data)
+        for tp, p in zip(self.target_critic.parameters(), self.critic.parameters()):
+            tp.data.copy_(self.tau * p.data + (1.0 - self.tau) * tp.data)
+
+    def compute_td_error(self, s, a, r, s_next, done):
+        # compute TD error magnitude: | y - Q(s,a) |
+        self.actor.eval(); self.critic.eval(); self.target_actor.eval(); self.target_critic.eval()
+        with torch.no_grad():
+            s_t = torch.FloatTensor(s).unsqueeze(0).to(device)
+            a_t = torch.FloatTensor(a).unsqueeze(0).to(device)
+            s_next_t = torch.FloatTensor(s_next).unsqueeze(0).to(device)
+            r_t = torch.FloatTensor([r]).to(device)
+            done_t = torch.FloatTensor([done]).to(device)
+
+            q_pred = self.critic(s_t, a_t).squeeze(0)
+            a_next = self.target_actor(s_next_t)
+            q_target_next = self.target_critic(s_next_t, a_next).squeeze(0)
+            y = r_t + (1.0 - done_t) * self.gamma * q_target_next
+            td = float(torch.abs(y - q_pred).cpu().item())
+        self.actor.train(); self.critic.train(); self.target_actor.train(); self.target_critic.train()
+        return td
+
+
+    def train_step(self, batch_size):
+        batch = self.buffer.sample(batch_size)
+        if len(batch) == 0:
+            return None, None
+        states = torch.FloatTensor(np.stack([b[0] for b in batch])).to(device)
+        actions = torch.FloatTensor(np.stack([b[1] for b in batch])).to(device)
+        rewards = torch.FloatTensor(np.array([b[2] for b in batch], dtype=np.float32)).unsqueeze(1).to(device)
+        next_states = torch.FloatTensor(np.stack([b[3] for b in batch])).to(device)
+        dones = torch.FloatTensor(np.array([b[4] for b in batch], dtype=np.float32)).unsqueeze(1).to(device)
+
+        # Critic update
+        with torch.no_grad():
+            target_actions = self.target_actor(next_states)
+            target_q = self.target_critic(next_states, target_actions)
+            y = rewards + (1.0 - dones) * self.gamma * target_q
+
+        q_values = self.critic(states, actions)
+        critic_loss = nn.MSELoss()(q_values, y)
+
+        self.c_opt.zero_grad()
+        critic_loss.backward()
+        self.c_opt.step()
+
+        # Actor update (maximize Q)
+        actor_loss = -self.critic(states, self.actor(states)).mean()
+        self.a_opt.zero_grad()
+        actor_loss.backward()
+        self.a_opt.step()
+
+        # soft update
+        self.soft_update()
+
+        return float(critic_loss.item()), float(actor_loss.item())
